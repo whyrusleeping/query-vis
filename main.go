@@ -15,6 +15,90 @@ import (
 	. "github.com/whyrusleeping/stump"
 )
 
+type QueryOp struct {
+	active  map[string]time.Time
+	toQuery map[string]struct{}
+	dialing map[string]time.Time
+
+	begin time.Time
+	took  time.Duration
+
+	goodDials []time.Duration
+	failDials []time.Duration
+	responses []time.Duration
+}
+
+func NewQueryOp() *QueryOp {
+	return &QueryOp{
+		active:  make(map[string]time.Time),
+		toQuery: make(map[string]struct{}),
+		dialing: make(map[string]time.Time),
+		begin:   time.Now(),
+	}
+}
+
+func (qo *QueryOp) HandleQueryEvent(qe notif.QueryEvent) {
+	switch qe.Type {
+	case notif.SendingQuery:
+		t, ok := qo.dialing[qe.ID.Pretty()]
+		if ok {
+			took := time.Now().Sub(t)
+			qo.goodDials = append(qo.goodDials, took)
+			Log("dial %s took %s", qe.ID, took)
+			delete(qo.dialing, qe.ID.Pretty())
+		}
+		Log("querying: ", qe.ID)
+		qo.active[qe.ID.Pretty()] = time.Now()
+		delete(qo.toQuery, qe.ID.Pretty())
+	case notif.PeerResponse:
+		t, ok := qo.active[qe.ID.Pretty()]
+		if !ok {
+			Fatal("received response from peer we didnt query")
+		}
+
+		took := time.Now().Sub(t)
+		qo.responses = append(qo.responses, took)
+
+		Log("response from: %s in %s", qe.ID, took)
+		Log("peerinfos")
+		delete(qo.active, qe.ID.Pretty())
+		for _, pe := range qe.Responses {
+			Log("\t%s [%d]", pe.ID.Pretty(), len(pe.Addrs))
+		}
+	case notif.Value:
+		Log("value from: ", qe.ID)
+		qo.took = time.Now().Sub(qo.begin)
+	case notif.AddingPeer:
+		qo.toQuery[qe.ID.Pretty()] = struct{}{}
+	case notif.DialingPeer:
+		qo.dialing[qe.ID.Pretty()] = time.Now()
+	case notif.QueryError:
+		Error("query error: %s %s", qe.ID, qe.Extra)
+		t, ok := qo.dialing[qe.ID.Pretty()]
+		if ok {
+			took := time.Now().Sub(t)
+			qo.failDials = append(qo.failDials, took)
+			Error("dial failed in %s", took)
+			delete(qo.dialing, qe.ID.Pretty())
+		}
+	default:
+		Log("unrecognized type: ", qe.Type)
+	}
+}
+func (qo *QueryOp) PrintFinal() {
+	Log("\n\n\nquery finished in", qo.took)
+	Log("dialed a total of %d peers", len(qo.goodDials)+len(qo.failDials))
+	Log("%d dials failed in an average of %s", len(qo.failDials), averageTimes(qo.failDials))
+	Log("%d dials succeeded in an average of %s", len(qo.goodDials), averageTimes(qo.goodDials))
+	Log("received a total of %d responses, average time %s", len(qo.responses), averageTimes(qo.responses))
+	Log("no responses from %d peers", len(qo.active))
+	for k, _ := range qo.active {
+		Log("  - %s", k)
+	}
+	Log("%d peers unqueried", len(qo.toQuery))
+	Log("%d dials pending at finish", len(qo.dialing))
+}
+
 func main() {
 	host := "http://localhost:5001"
 
@@ -23,7 +107,7 @@ func main() {
 	}
 	key := os.Args[1]
 
-	begin := time.Now()
+	qo := NewQueryOp()
 	url := fmt.Sprintf("%s/api/v0/dht/get?v=true&arg=%s", host, key)
 	resp, err := http.Get(url)
 	if err != nil {
@@ -31,12 +115,6 @@ func main() {
 	}
 
 	dec := json.NewDecoder(resp.Body)
-	active := make(map[string]time.Time)
-	toQuery := make(map[string]struct{})
-	dialing := make(map[string]time.Time)
-	var goodDials []time.Duration
-	var failDials []time.Duration
-	var responses []time.Duration
 	for {
 		var qe notif.QueryEvent
 		err := dec.Decode(&qe)
@@ -48,60 +126,10 @@ func main() {
 			Fatal(err)
 		}
 
-		switch qe.Type {
-		case notif.SendingQuery:
-			t, ok := dialing[qe.ID.Pretty()]
-			if ok {
-				took := time.Now().Sub(t)
-				goodDials = append(goodDials, took)
-				Log("dial %s took %s", qe.ID, took)
-				delete(dialing, qe.ID.Pretty())
-			}
-			Log("querying: ", qe.ID)
-			active[qe.ID.Pretty()] = time.Now()
-			delete(toQuery, qe.ID.Pretty())
-		case notif.PeerResponse:
-			t, ok := active[qe.ID.Pretty()]
-			if !ok {
-				Fatal("received response from peer we didnt query")
-			}
-
-			took := time.Now().Sub(t)
-			responses = append(responses, took)
-
-			Log("response from: %s in %s", qe.ID, took)
-			Log("peerinfos")
-			delete(active, qe.ID.Pretty())
-			for _, pe := range qe.Responses {
-				Log("\t%s [%d]", pe.ID.Pretty(), len(pe.Addrs))
-			}
-		case notif.Value:
-			took := time.Now().Sub(begin)
-			Log("\n\n\nquery finished in", took)
-			Log("dialed a total of %d peers", len(goodDials)+len(failDials))
-			Log("%d dials failed in an average of %s", len(failDials), averageTimes(failDials))
-			Log("%d dials succeeded in an average of %s", len(goodDials), averageTimes(goodDials))
-			Log("received a total of %d responses, average time %s", len(responses), averageTimes(responses))
-			Log("no responses from %d peers", len(active))
-			Log("%d peers unqueried", len(toQuery))
-			Log("%d dials pending at finish", len(dialing))
-		case notif.AddingPeer:
-			toQuery[qe.ID.Pretty()] = struct{}{}
-		case notif.DialingPeer:
-			dialing[qe.ID.Pretty()] = time.Now()
-		case notif.QueryError:
-			Error("query error: %s %s", qe.ID, qe.Extra)
-			t, ok := dialing[qe.ID.Pretty()]
-			if ok {
-				took := time.Now().Sub(t)
-				failDials = append(failDials, took)
-				Error("dial failed in %s", took)
-				delete(dialing, qe.ID.Pretty())
-			}
-		default:
-			Log("unrecognized type: ", qe.Type)
-		}
+		qo.HandleQueryEvent(qe)
 	}
+
+	qo.PrintFinal()
 }
 
 func averageTimes(ts []time.Duration) time.Duration {
